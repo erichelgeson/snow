@@ -8,10 +8,11 @@ use crate::loaders::{
 use crate::{FloppyImage, FloppyType};
 
 use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
 use strum::{Display, IntoEnumIterator};
 
 /// Types of supported floppy images
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Display, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Display, Copy, Clone, Serialize, Deserialize)]
 pub enum ImageType {
     A2R2,
     A2R3,
@@ -106,7 +107,8 @@ impl Autodetect {
 
 impl FloppyImageLoader for Autodetect {
     fn load(data: &[u8], filename: Option<&str>) -> Result<FloppyImage> {
-        match Self::detect(data)? {
+        let image_type = Self::detect(data)?;
+        let mut image = match image_type {
             ImageType::A2R2 => A2Rv2::load(data, filename),
             ImageType::A2R3 => A2Rv3::load(data, filename),
             ImageType::Bitfile => Bitfile::load(data, filename),
@@ -127,6 +129,8 @@ impl FloppyImageLoader for Autodetect {
                     unreachable!()
                 }
             }
-        }
+        }?;
+        image.set_source_format(image_type);
+        Ok(image)
     }
 }

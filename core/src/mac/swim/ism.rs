@@ -144,6 +144,36 @@ impl Swim {
         out
     }
 
+    /// Encodes a byte using MFM encoding.
+    /// MFM places clock bits between data bits: C7 D7 C6 D6 ... C0 D0
+    /// Clock bit is 1 only when both previous and current data bits are 0.
+    /// Returns (encoded 16-bit word, last data bit for chaining)
+    fn ism_mfm_encode(data: u8, prev_bit: bool) -> (u16, bool) {
+        let mut out: u16 = 0;
+        let mut last_bit = prev_bit;
+
+        // Process bits from MSB to LSB (bit 7 to bit 0)
+        for i in (0..8).rev() {
+            let data_bit = (data >> i) & 1 != 0;
+            let bit_pos = i * 2; // Data bit position in output
+
+            // Set data bit
+            if data_bit {
+                out |= 1 << bit_pos;
+            }
+
+            // Set clock bit (position is bit_pos + 1)
+            // Clock is 1 only if both previous data bit and current data bit are 0
+            if !last_bit && !data_bit {
+                out |= 1 << (bit_pos + 1);
+            }
+
+            last_bit = data_bit;
+        }
+
+        (out, last_bit)
+    }
+
     fn ism_fifo_pop(&mut self, expect_marker: bool) -> Option<(bool, u8)> {
         match self.ism_fifo.pop_front()? {
             IsmFifoEntry::Data(d) => Some((false, d)),
@@ -190,12 +220,22 @@ impl Swim {
                         .with_motoron(self.get_selected_drive().motor)
                         .with_error(self.ism_error.0 != 0)
                         .with_fifo_two(
-                            // TODO write mode
-                            self.ism_fifo.len() >= 2,
+                            // In write mode, indicates FIFO has room for 2+ bytes
+                            // In read mode, indicates FIFO has 2+ bytes available
+                            if self.ism_mode.write() {
+                                self.ism_fifo.len() < 2
+                            } else {
+                                self.ism_fifo.len() >= 2
+                            },
                         )
                         .with_fifo_one(
-                            // TODO write mode
-                            !self.ism_fifo.is_empty(),
+                            // In write mode, indicates FIFO has room for 1+ byte
+                            // In read mode, indicates FIFO has 1+ byte available
+                            if self.ism_mode.write() {
+                                self.ism_fifo.is_empty() || self.ism_fifo.len() < 2
+                            } else {
+                                !self.ism_fifo.is_empty()
+                            },
                         )
                         .0,
                 ),
@@ -233,7 +273,19 @@ impl Swim {
             //    addr, offset, reg, value
             //);
             match reg {
-                IsmRegister::Data | IsmRegister::Mark => (),
+                IsmRegister::Data | IsmRegister::Mark => {
+                    // In write mode, push data to FIFO for writing to disk
+                    if self.ism_mode.write() && self.ism_mode.action() {
+                        if self.ism_fifo.len() >= 2 {
+                            warn!("ISM write FIFO overrun");
+                            self.ism_error.set_overrun(true);
+                        } else if matches!(reg, IsmRegister::Mark) {
+                            self.ism_fifo.push_back(IsmFifoEntry::Marker(value));
+                        } else {
+                            self.ism_fifo.push_back(IsmFifoEntry::Data(value));
+                        }
+                    }
+                }
                 IsmRegister::Phase => self.ism_write_phases(value),
                 IsmRegister::ModeZero => {
                     self.ism_param_idx = 0;
@@ -252,13 +304,17 @@ impl Swim {
                     let set = IsmStatus(value & !self.ism_mode.0);
                     if set.action() {
                         if self.ism_mode.write() {
-                            error!("Entered write mode, TODO");
+                            // Entering write mode - initialize write state
+                            self.ism_write_shreg = 0;
+                            self.ism_write_shreg_cnt = 0;
+                            self.ism_write_prev_bit = false;
+                            self.ism_fifo.clear();
+                        } else {
+                            // Entering read mode - reset sync/shifter
+                            self.ism_synced = false;
+                            self.ism_shreg = 0;
+                            self.ism_shreg_cnt = 0;
                         }
-
-                        // Entered read/write mode, reset sync/shifter
-                        self.ism_synced = false;
-                        self.ism_shreg = 0;
-                        self.ism_shreg_cnt = 0;
                     }
                     self.ism_mode.0 |= value;
                 }
@@ -319,6 +375,11 @@ impl Swim {
             return Ok(());
         }
 
+        if self.ism_mode.write() {
+            return self.ism_tick_write();
+        }
+
+        // Read mode
         if self.get_selected_drive().floppy.get_track_type(
             self.get_active_head(),
             self.get_selected_drive().get_active_track(),
@@ -368,5 +429,107 @@ impl Swim {
         }
 
         Ok(())
+    }
+
+    /// Handle ISM write mode tick - writes MFM encoded data to disk
+    fn ism_tick_write(&mut self) -> Result<()> {
+        let head = self.get_active_head();
+        let track = self.get_selected_drive().get_active_track();
+
+        // Check if we need to convert flux track to bitstream for writing
+        if self.get_selected_drive().floppy.get_track_type(head, track) == TrackType::Flux {
+            // Convert flux track to bitstream before writing
+            self.get_selected_drive_mut()
+                .floppy
+                .convert_flux_to_bitstream(head, track);
+        }
+
+        // If shift register is empty, try to refill from FIFO
+        if self.ism_write_shreg_cnt == 0 {
+            if let Some(entry) = self.ism_fifo.pop_front() {
+                match entry {
+                    IsmFifoEntry::Marker(data) => {
+                        // Markers use pre-encoded sync pattern (0xA1 with missing clock)
+                        if data == 0xA1 {
+                            self.ism_write_shreg = Self::MFM_SYNC_MARKER;
+                            // For sync marker, the last data bit is 1 (0xA1 = 10100001)
+                            self.ism_write_prev_bit = true;
+                        } else {
+                            // Other markers are MFM encoded normally
+                            let (encoded, prev) =
+                                Self::ism_mfm_encode(data, self.ism_write_prev_bit);
+                            self.ism_write_shreg = encoded;
+                            self.ism_write_prev_bit = prev;
+                        }
+                        self.ism_write_shreg_cnt = 16;
+                    }
+                    IsmFifoEntry::Data(data) => {
+                        let (encoded, prev) = Self::ism_mfm_encode(data, self.ism_write_prev_bit);
+                        self.ism_write_shreg = encoded;
+                        self.ism_write_prev_bit = prev;
+                        self.ism_write_shreg_cnt = 16;
+                    }
+                }
+            } else {
+                // FIFO empty - underrun (this is normal at end of write)
+                return Ok(());
+            }
+        }
+
+        // Write one bit from shift register (MSB first)
+        let bit = (self.ism_write_shreg >> 15) & 1 != 0;
+        self.get_selected_drive_mut().write_bit(head, bit);
+
+        // Advance track position and shift register
+        let _ = self.get_selected_drive_mut().next_bit(head);
+        self.ism_write_shreg <<= 1;
+        self.ism_write_shreg_cnt -= 1;
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mfm_encode_decode_roundtrip() {
+        for byte in 0..=255u8 {
+            let (encoded, _) = Swim::ism_mfm_encode(byte, false);
+            let decoded = Swim::ism_mfm_decode(encoded);
+            assert_eq!(
+                byte, decoded,
+                "Round-trip failed for byte {:#04x}: encoded={:#018b}, decoded={:#04x}",
+                byte, encoded, decoded
+            );
+        }
+    }
+
+    #[test]
+    fn test_mfm_sync_marker_decodes_to_a1() {
+        let decoded = Swim::ism_mfm_decode(Swim::MFM_SYNC_MARKER);
+        assert_eq!(decoded, 0xA1, "Sync marker should decode to 0xA1");
+    }
+
+    #[test]
+    fn test_mfm_encode_clock_bits() {
+        // Test that clock bits are only set when both prev and current data bits are 0
+        // 0x00 with prev_bit=false should have all clock bits set
+        let (encoded, _) = Swim::ism_mfm_encode(0x00, false);
+        // All 8 clock bits should be 1, all 8 data bits should be 0
+        // Pattern: 10 10 10 10 10 10 10 10
+        assert_eq!(
+            encoded, 0b10101010_10101010,
+            "0x00 with prev=false should be all clocks"
+        );
+
+        // 0xFF should have no clock bits (all data bits are 1)
+        let (encoded, _) = Swim::ism_mfm_encode(0xFF, false);
+        // Pattern: 01 01 01 01 01 01 01 01
+        assert_eq!(
+            encoded, 0b01010101_01010101,
+            "0xFF should have no clock bits"
+        );
     }
 }

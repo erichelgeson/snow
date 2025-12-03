@@ -10,6 +10,7 @@ use serde_big_array::{Array, BigArray};
 use strum::EnumIter;
 
 use flux::FluxTicks;
+pub use loaders::ImageType;
 
 pub mod built_info {
     include!(concat!(env!("OUT_DIR"), "/built.rs"));
@@ -183,6 +184,10 @@ pub struct FloppyImage {
 
     /// Force floppy read-only
     force_wp: bool,
+
+    /// Original image format this was loaded from (for save auto-detection)
+    #[serde(default)]
+    source_format: Option<ImageType>,
 }
 
 impl FloppyImage {
@@ -223,7 +228,18 @@ impl FloppyImage {
             origtracktype: [Default::default(); FLOPPY_MAX_SIDES],
             dirty: false,
             force_wp: false,
+            source_format: None,
         }
+    }
+
+    /// Sets the source format of this image (for save auto-detection)
+    pub fn set_source_format(&mut self, format: ImageType) {
+        self.source_format = Some(format);
+    }
+
+    /// Gets the source format of this image
+    pub fn get_source_format(&self) -> Option<ImageType> {
+        self.source_format
     }
 
     /// Resizes the length of a track to the actual size used in the image
@@ -354,13 +370,70 @@ impl Floppy for FloppyImage {
     }
 
     fn get_write_protect(&self) -> bool {
-        // TODO write-protected until write is implemented for flux
-        // and SuperDrive
+        // Forced write protection only - flux tracks can be converted on-demand
         self.force_wp
-            || self.get_type() == FloppyType::Mfm144M
-            || self
-                .flux_trackdata
-                .iter()
-                .any(|s| s.iter().any(|t| !t.is_empty()))
+    }
+}
+
+impl FloppyImage {
+    /// Converts a flux track to a bitstream track.
+    /// This is needed when writing to a track that was originally loaded as flux.
+    /// The flux data is decoded to bitstream using MFM timing.
+    pub fn convert_flux_to_bitstream(&mut self, side: usize, track: usize) {
+        if self.get_track_type(side, track) != TrackType::Flux {
+            return;
+        }
+
+        // Take the flux data
+        let flux_data = std::mem::take(&mut self.flux_trackdata[side][track]);
+        if flux_data.is_empty() {
+            return;
+        }
+
+        // Calculate expected track length for MFM
+        let track_len = self.floppy_type.get_approx_track_length(track);
+
+        // Initialize bitstream track with zeros
+        self.bitlen[side][track] = track_len;
+        self.trackdata[side][track] = vec![0u8; track_len / 8 + 1];
+
+        // Decode flux transitions to bitstream using MFM timing
+        // MFM at 300 RPM with 500kbps data rate = 2us per bit cell
+        // With 8MHz base clock, that's 16 ticks per bit cell
+        // Flux ticks are in units that vary by format, typically ~8MHz
+        const TICKS_PER_BIT_CELL: i16 = 16;
+        const HALF_CELL: i16 = TICKS_PER_BIT_CELL / 2;
+
+        let mut bit_position = 0;
+        let mut accumulated_ticks: i16 = 0;
+
+        for transition in flux_data {
+            accumulated_ticks += transition;
+
+            // Determine how many bit cells this transition spans
+            // Round to nearest bit cell count
+            let bit_cells = ((accumulated_ticks + HALF_CELL) / TICKS_PER_BIT_CELL) as usize;
+
+            if bit_cells > 0 {
+                // Write zeros for intermediate bit cells
+                for _ in 0..bit_cells.saturating_sub(1) {
+                    if bit_position < track_len {
+                        // Bit is already 0 from initialization
+                        bit_position += 1;
+                    }
+                }
+                // Write a 1 for the transition
+                if bit_position < track_len {
+                    self.push_track_bit(side, track, bit_position, true);
+                    bit_position += 1;
+                }
+
+                accumulated_ticks -= (bit_cells as i16) * TICKS_PER_BIT_CELL;
+            }
+        }
+
+        // Update the actual track length to what we wrote
+        self.bitlen[side][track] = bit_position.min(track_len);
+        self.origtracktype[side][track] = OriginalTrackType::Bitstream;
     }
 }

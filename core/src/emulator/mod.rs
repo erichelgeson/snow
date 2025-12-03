@@ -5,7 +5,7 @@ pub mod save;
 
 use serde::{Deserialize, Serialize};
 use snow_floppy::loaders::{Autodetect, FloppyImageLoader, FloppyImageSaver, Moof};
-use snow_floppy::Floppy;
+use snow_floppy::{Floppy, ImageType};
 use std::collections::VecDeque;
 #[cfg(feature = "savestates")]
 use std::fs::File;
@@ -863,10 +863,29 @@ impl Tickable for Emulator {
                         self.status_update()?;
                     }
                     EmulatorCommand::SaveFloppy(drive, filename) => {
-                        if let Err(e) = Moof::save_file(
-                            self.config.swim().get_active_image(drive),
-                            &filename.to_string_lossy(),
-                        ) {
+                        let image = self.config.swim().get_active_image(drive);
+                        let filename_str = filename.to_string_lossy();
+
+                        // Determine save format: prefer source format, fall back to extension
+                        let ext = filename
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+
+                        let save_result = match image.get_source_format() {
+                            // Use source format if available (auto-detect)
+                            Some(ImageType::MOOF) => Moof::save_file(image, &filename_str),
+                            // For other source formats, save as MOOF (preserves bitstream)
+                            Some(_) => Moof::save_file(image, &filename_str),
+                            // No source format - use extension or default to MOOF
+                            None => match ext.as_str() {
+                                "moof" => Moof::save_file(image, &filename_str),
+                                _ => Moof::save_file(image, &filename_str),
+                            },
+                        };
+
+                        if let Err(e) = save_result {
                             self.user_error(&format!(
                                 "Cannot save file '{}': {}",
                                 filename.file_name().unwrap_or_default().to_string_lossy(),
