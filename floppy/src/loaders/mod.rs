@@ -13,7 +13,7 @@ mod pfi;
 mod pri;
 mod raw;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use a2r2::A2Rv2;
 pub use a2r3::A2Rv3;
@@ -36,10 +36,15 @@ pub trait FloppyImageLoader {
     fn load(data: &[u8], filename: Option<&str>) -> Result<FloppyImage>;
 
     fn load_file(filename: &str) -> Result<FloppyImage> {
-        Self::load(
+        let mut img = Self::load(
             &std::fs::read(filename)?,
             Path::new(filename).file_name().and_then(|s| s.to_str()),
-        )
+        )?;
+        // Set the source path for auto-save functionality
+        if let Ok(path) = PathBuf::from(filename).canonicalize() {
+            img.set_source_path(path);
+        }
+        Ok(img)
     }
 }
 

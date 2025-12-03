@@ -5,7 +5,7 @@ pub mod save;
 
 use serde::{Deserialize, Serialize};
 use snow_floppy::loaders::{Autodetect, FloppyImageLoader, FloppyImageSaver, Moof};
-use snow_floppy::{Floppy, ImageType};
+use snow_floppy::{Floppy, FloppyImage, ImageType};
 use std::collections::VecDeque;
 #[cfg(feature = "savestates")]
 use std::fs::File;
@@ -223,6 +223,9 @@ dispatch! {
 }
 
 /// Emulator runner
+/// Interval for periodic auto-save of dirty floppies (30 seconds)
+const FLOPPY_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(30);
+
 pub struct Emulator {
     config: EmulatorConfig,
     command_recv: crossbeam_channel::Receiver<EmulatorCommand>,
@@ -235,6 +238,8 @@ pub struct Emulator {
     record_input: Option<InputRecording>,
     replay_input: VecDeque<(Ticks, EmulatorCommand)>,
     peripheral_debug: bool,
+    /// Last auto-save time for each floppy drive
+    last_floppy_save: [Option<Instant>; 3],
 }
 
 impl Emulator {
@@ -436,6 +441,7 @@ impl Emulator {
             record_input: None,
             replay_input: VecDeque::default(),
             peripheral_debug: false,
+            last_floppy_save: [None; 3],
         };
         emu.status_update()?;
 
@@ -478,6 +484,7 @@ impl Emulator {
             record_input: None,
             replay_input: VecDeque::default(),
             peripheral_debug: false,
+            last_floppy_save: [None; 3],
         };
         emu.status_update()?;
         log::info!(
@@ -511,12 +518,100 @@ impl Emulator {
     }
 
     fn status_update(&mut self) -> Result<()> {
+        // Collect ejected images first to avoid borrow issues
+        let mut ejected_images: Vec<(usize, Box<FloppyImage>)> = Vec::new();
         for (i, drive) in self.config.swim_mut().drives.iter_mut().enumerate() {
             if let Some(img) = drive.take_ejected_image() {
-                self.event_sender
-                    .send(EmulatorEvent::FloppyEjected(i, img))?;
+                ejected_images.push((i, img));
             }
         }
+
+        // Now handle ejected images (including auto-save)
+        for (i, mut img) in ejected_images {
+            // Auto-save dirty floppies on eject
+            if img.is_dirty() {
+                if let Some(source_path) = img.get_source_path().cloned() {
+                    let path_str = source_path.to_string_lossy().to_string();
+                    let filename = source_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    match Moof::save_file(&img, &path_str) {
+                        Ok(()) => {
+                            img.clear_dirty();
+                            info!("Auto-saved floppy to '{}'", path_str);
+                            self.user_success(&format!("Auto-saved floppy to '{}'", filename));
+                        }
+                        Err(e) => {
+                            warn!("Failed to auto-save floppy: {}", e);
+                            self.user_error(&format!("Failed to auto-save floppy: {}", e));
+                            // Send to frontend for manual save
+                            self.event_sender
+                                .send(EmulatorEvent::FloppyNeedsSave(i, img))?;
+                            continue;
+                        }
+                    }
+                } else {
+                    // No source path - prompt user to save
+                    self.event_sender
+                        .send(EmulatorEvent::FloppyNeedsSave(i, img))?;
+                    continue;
+                }
+            }
+            self.event_sender
+                .send(EmulatorEvent::FloppyEjected(i, img))?;
+        }
+
+        // Periodic auto-save for inserted dirty floppies
+        let now = Instant::now();
+        for i in 0..3 {
+            let drive = &self.config.swim().drives[i];
+            if !drive.floppy_inserted {
+                // Reset save timer when no disk is inserted
+                self.last_floppy_save[i] = None;
+                continue;
+            }
+
+            let floppy = &drive.floppy;
+            if !floppy.is_dirty() {
+                continue;
+            }
+
+            let Some(source_path) = floppy.get_source_path().cloned() else {
+                continue;
+            };
+
+            let should_save = match self.last_floppy_save[i] {
+                None => true, // First save since insert
+                Some(last) => now.duration_since(last) >= FLOPPY_AUTOSAVE_INTERVAL,
+            };
+
+            if should_save {
+                let path_str = source_path.to_string_lossy().to_string();
+                let filename = source_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                match Moof::save_file(floppy, &path_str) {
+                    Ok(()) => {
+                        // Get mutable reference to clear dirty flag
+                        self.config.swim_mut().drives[i].floppy.clear_dirty();
+                        self.last_floppy_save[i] = Some(now);
+                        info!("Periodic auto-save floppy to '{}'", path_str);
+                        self.user_success(&format!("Auto-saved floppy to '{}'", filename));
+                    }
+                    Err(e) => {
+                        warn!("Failed to auto-save floppy: {}", e);
+                        // Don't show error to user for periodic saves, just log it
+                        // Reset timer to try again later
+                        self.last_floppy_save[i] = Some(now);
+                    }
+                }
+            }
+        }
+
         for (id, target) in self
             .config
             .scsi_mut()
@@ -892,6 +987,10 @@ impl Tickable for Emulator {
                                 e
                             ));
                         } else {
+                            // Clear dirty flag and update source path after successful save
+                            let image = self.config.swim_mut().get_active_image_mut(drive);
+                            image.clear_dirty();
+                            image.set_source_path(filename.clone());
                             self.user_success(&format!(
                                 "Saved floppy image as '{}'",
                                 filename.file_name().unwrap_or_default().to_string_lossy()

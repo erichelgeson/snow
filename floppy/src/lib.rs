@@ -3,6 +3,7 @@ pub mod loaders;
 mod macformat;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -188,6 +189,10 @@ pub struct FloppyImage {
     /// Original image format this was loaded from (for save auto-detection)
     #[serde(default)]
     source_format: Option<ImageType>,
+
+    /// Path to the source file this image was loaded from (for auto-save)
+    #[serde(default)]
+    source_path: Option<PathBuf>,
 }
 
 impl FloppyImage {
@@ -229,6 +234,7 @@ impl FloppyImage {
             dirty: false,
             force_wp: false,
             source_format: None,
+            source_path: None,
         }
     }
 
@@ -299,6 +305,21 @@ impl FloppyImage {
     /// Check if image was written to
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    /// Clears the dirty flag after saving
+    pub fn clear_dirty(&mut self) {
+        self.dirty = false;
+    }
+
+    /// Sets the source path of this image (for auto-save)
+    pub fn set_source_path(&mut self, path: PathBuf) {
+        self.source_path = Some(path);
+    }
+
+    /// Gets the source path of this image
+    pub fn get_source_path(&self) -> Option<&PathBuf> {
+        self.source_path.as_ref()
     }
 
     /// Forces floppy to be write-protected

@@ -285,6 +285,10 @@ impl Swim {
     pub fn get_active_image(&self, drive: usize) -> &FloppyImage {
         &self.drives[drive].floppy
     }
+
+    pub fn get_active_image_mut(&mut self, drive: usize) -> &mut FloppyImage {
+        &mut self.drives[drive].floppy
+    }
 }
 
 impl BusMember<Address> for Swim {

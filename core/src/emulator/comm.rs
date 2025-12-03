@@ -136,6 +136,8 @@ pub enum EmulatorEvent {
     NextCode((Address, Vec<u8>)),
     UserMessage(UserMessageType, String),
     FloppyEjected(usize, Box<FloppyImage>),
+    /// A dirty floppy was ejected but has no source path - frontend should prompt to save
+    FloppyNeedsSave(usize, Box<FloppyImage>),
     ScsiMediaEjected(usize),
     Memory((Address, Vec<u8>, usize)),
     RecordedInput(InputRecording),

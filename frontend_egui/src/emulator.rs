@@ -112,6 +112,8 @@ pub struct EmulatorState {
     disasm_code: DisassemblyListing,
     messages: VecDeque<(UserMessageType, String)>,
     pub last_images: [RefCell<Option<Box<FloppyImage>>>; 3],
+    /// Floppy images that need saving (ejected dirty with no source path)
+    pub pending_save_images: VecDeque<(usize, Box<FloppyImage>)>,
     ram_update: VecDeque<(Address, Vec<u8>, usize)>,
     record_input_path: Option<PathBuf>,
     instruction_history: Vec<HistoryEntry>,
@@ -483,6 +485,18 @@ impl EmulatorState {
                         format!("Floppy #{} ejected ({})", idx + 1, img.get_title()),
                     ));
                     *self.last_images[idx].borrow_mut() = Some(img);
+                }
+                EmulatorEvent::FloppyNeedsSave(idx, img) => {
+                    self.messages.push_back((
+                        UserMessageType::Warning,
+                        format!(
+                            "Floppy #{} ejected with unsaved changes ({})",
+                            idx + 1,
+                            img.get_title()
+                        ),
+                    ));
+                    // Queue the image for save dialog
+                    self.pending_save_images.push_back((idx, img));
                 }
                 EmulatorEvent::ScsiMediaEjected(id) => {
                     self.messages

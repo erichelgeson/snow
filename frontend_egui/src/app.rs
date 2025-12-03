@@ -2033,6 +2033,14 @@ impl eframe::App for SnowGui {
                 ui.allocate_space(ui.available_size());
             });
 
+        // Check for pending floppy saves (ejected dirty images with no source path)
+        if self.floppy_dialog.state() != egui_file_dialog::DialogState::Open {
+            if let Some((_idx, img)) = self.emu.pending_save_images.pop_front() {
+                self.floppy_dialog_target = FloppyDialogTarget::Image(img);
+                self.floppy_dialog.save_file();
+            }
+        }
+
         // Floppy image picker dialog
         let mut last = None;
         self.floppy_dialog
